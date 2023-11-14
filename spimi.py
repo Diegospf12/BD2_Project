@@ -5,7 +5,9 @@ import re
 import json
 import math
 import collections
+import time
 import shutil
+import glob
 from collections import defaultdict
 import numpy as np
 import pandas as pd
@@ -25,7 +27,7 @@ class LoadData:
 
 class SPIMI:
     def __init__(self, data):
-        self.block_limit = 2000
+        self.block_limit = 20000
         self.data = data
         self.data = self.data[['id', 'gender', 'masterCategory', 'subCategory', 'articleType', 'baseColour', 'season', 'usage', 'productDisplayName']]
 
@@ -110,11 +112,32 @@ class SPIMI:
         with open('merged.json', 'w') as file:
             json.dump(merged_dict, file)
 
-    def spimi_invert(self):
-        block_number = 0
-        local_index = {}
-        for index, row in self.data.iterrows():
+    def process_all(self):
+        docs = []
+        total_terms = 0
+        for index, row in data.iterrows():
             doc = self.preprocess(row)
+            total_terms += len(doc["terms"])
+            docs.append(doc)
+        return docs, total_terms
+    
+    def calcular_bloques(self, total_terms):
+        total_bloques = total_terms // self.block_limit
+        bloques_potencia_de_dos = 1
+        while bloques_potencia_de_dos * 2 <= total_bloques:
+            bloques_potencia_de_dos *= 2
+        return bloques_potencia_de_dos
+
+    def spimi_invert(self):
+        docs, total_terms = self.process_all()
+        block_number = 0
+        terms_processed = 0
+        total_blocks = self.calcular_bloques(total_terms)
+        terms_processed_per_block = math.ceil(total_terms/total_blocks)
+        local_index = {}
+        
+        for i in docs:
+            doc = i
             for term in doc["terms"]:
                 if term not in local_index:
                     local_index[term] = [{"id": doc["id"], "tf": 1}]
@@ -129,26 +152,35 @@ class SPIMI:
                     if not doc_found:
                         # Si el id del documento no se encuentra después de la iteración completa, agrega un nuevo documento
                         local_index[term].append({"id": doc["id"], "tf": 1})
-                if(len(local_index) > self.block_limit):
+                terms_processed += 1
+                if(terms_processed >= terms_processed_per_block):
                     sorted_dictionary = collections.OrderedDict(sorted(local_index.items()))
                     os.makedirs('local_indexes', exist_ok=True)
                     with open(f'local_indexes/block_{block_number}.json', 'w') as file:
                         json.dump(sorted_dictionary, file)
                     local_index.clear()
                     block_number += 1
-        self.merge('local_indexes')
+                    terms_processed = 0
+
+        # Comprueba si quedan términos en el último bloque
+        if local_index:
+            sorted_dictionary = collections.OrderedDict(sorted(local_index.items()))
+            os.makedirs('local_indexes', exist_ok=True)
+            with open(f'local_indexes/block_{block_number}.json', 'w') as file:
+                json.dump(sorted_dictionary, file)
+        self.binary_merge(total_blocks)
 
 
 class TextRetrival:
     def __init__(self):
-        with open('merged.json', 'r') as file:
+        with open('global_index/block_0.json', 'r') as file:
             self.inverted_index = json.load(file)
 
     def process_query(self,query):
         tokens = nltk.word_tokenize(query)
         filtered_text = [stemmer.stem(w) for w in tokens if not w in stopwords_list and re.match("^[a-zA-Z]+$", w)]
         return filtered_text
-    
+
     def cosine_score(self, query, k):
         processed_query = self.process_query(query)
         query_tf = {term: processed_query.count(term) for term in processed_query}
@@ -156,12 +188,15 @@ class TextRetrival:
 
         document_scores = defaultdict(float)
         for term, tf_q in query_tf.items():
-            if term in self.inverted_index:
-                df_t = len(self.inverted_index[term])
-                tfidf_t_q = math.log1p(tf_q) * math.log(len(self.inverted_index) / df_t)
-                for doc in self.inverted_index[term]:
-                    tfidf_t_d = math.log1p(doc["tf"]) * math.log(len(self.inverted_index) / df_t)
-                    document_scores[doc["id"]] += tfidf_t_d * tfidf_t_q
+            for index_file in glob.glob('global_index/*.json'):
+                with open(index_file, 'r') as file:
+                    inverted_index = json.load(file)
+                    if term in inverted_index:
+                        df_t = len(inverted_index[term])
+                        tfidf_t_q = math.log1p(tf_q) * math.log(len(inverted_index) / df_t)
+                        for doc in inverted_index[term]:
+                            tfidf_t_d = math.log1p(doc["tf"]) * math.log(len(inverted_index) / df_t)
+                            document_scores[doc["id"]] += tfidf_t_d * tfidf_t_q
 
         for doc_id in document_scores:
             document_scores[doc_id] /= norm_q
@@ -170,9 +205,27 @@ class TextRetrival:
         return [{"id":doc_id, "score":score} for doc_id, score in sorted_documents[:k]]
     
     def show_results(self, query, k, dataset):
+        start_time = time.time()
         relevant_doc_ids = [doc['id'] for doc in self.cosine_score(query, k)]
+        end_time = time.time()
+        elapsed_time = end_time - start_time
         relevant_docs = dataset[dataset['id'].isin(relevant_doc_ids)]
         print(relevant_docs)
+        print(elapsed_time)
+
+    def k_means(self, query, k, dataset):
+        start_time = time.time()
+        relevant_docs_scores = self.cosine_score(query, k)
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+
+        relevant_doc_ids = [doc['id'] for doc in relevant_docs_scores]
+        relevant_docs = dataset[dataset['id'].isin(relevant_doc_ids)]
+        
+        # Convertir cada registro a una cadena y agregarlo a la lista
+        records_list = [str(record) for record in relevant_docs.values]
+
+        return elapsed_time, records_list
         
             
 
@@ -182,7 +235,7 @@ if __name__ == "__main__":
     #spimi.spimi_invert()
 
     text_retrival = TextRetrival()
-    query = "rns"
+    query = "dress red rose"
     k = 10
     
     text_retrival.show_results(query, k, data)
